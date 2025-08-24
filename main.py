@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv(".env")
 
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -699,8 +700,10 @@ class TranscriptExtractionThread(QThread):
                         video_id = video_url.split("?v=")[1].split("&")[0]
                         fetched_transcript = None  # Initialize for this video
 
+                        ytt_api = YouTubeTranscriptApi()
+
                         # 1. Get the list of all available transcripts
-                        transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
+                        transcript_list_obj = ytt_api.list(video_id)
 
                         # 2. Try to find and fetch English first
                         try:

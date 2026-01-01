@@ -1,18 +1,20 @@
 import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QLineEdit, QPushButton, QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-                             QComboBox, QSlider) # Import QComboBox
+                             QComboBox, QSlider) 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QFont, QColor
 from datetime import datetime
 from pytube import Playlist
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
+from google.generativeai.types import HarmCategory, HarmBlockThreshold 
 import google.generativeai as genai
 import re
 import logging
 import os
 from dotenv import load_dotenv
 load_dotenv(".env")
+
 
 
 class MainWindow(QMainWindow):
@@ -85,8 +87,8 @@ Text:"""
         self.extraction_thread = None
         self.gemini_thread = None
         self.is_processing = False
-        self.available_models = ["gemini-1.5-flash", "gemini-1.5-pro","gemini-2.0-flash", "gemini-2.0-flash-thinking-exp-01-21", "gemini-2.5-pro-preview-03-25", "gemini-2.5-flash-preview-04-17", "gemini-2.0-flash-lite"] # Static model list
-        self.selected_model_name = "gemini-2.0-flash-thinking-exp-01-21" # Default model
+        self.available_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-thinking-exp-01-21", "gemini-2.5-flash-lite-preview-06-17","gemini-2.5-pro-preview-03-25", "gemini-2.0-flash-lite","gemini-1.5-flash", "gemini-1.5-pro"] # Static model list
+        self.selected_model_name = "gemini-2.5-flash" # Default model
 
         self.initUI()
 
@@ -671,35 +673,71 @@ class TranscriptExtractionThread(QThread):
 
     def run(self):
         try:
-            url = self.playlist_url 
+            url = self.playlist_url
 
-            if "playlist?list=" in url: # Check if it's a playlist URL
+            if "playlist?list=" in url:
                 playlist = Playlist(url)
                 video_urls = playlist.video_urls
                 total_videos = len(video_urls)
-                playlist_name = playlist.title # Get playlist name
-            elif "watch?v=" in url: # Check if it's a single video URL
-                video_urls = [url] # Treat it as a playlist of one video
+                playlist_name = playlist.title
+            elif "watch?v=" in url:
+                video_urls = [url]
                 total_videos = 1
                 playlist_name = "Single Video"
+            else:
+                # Handle invalid URL case
+                self.error_occurred.emit("Invalid URL provided. Please use a valid YouTube video or playlist URL.")
+                return
+
 
             with open(self.output_file, 'w', encoding='utf-8') as f:
-                f.write(f"Playlist Name: {playlist_name}\n\n") 
+                f.write(f"Playlist Name: {playlist_name}\n\n")
                 for index, video_url in enumerate(video_urls, 1):
                     if not self._is_running:
                         return
 
+                    
                     try:
                         video_id = video_url.split("?v=")[1].split("&")[0]
-                        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-                        transcript = ' '.join([transcript['text'] for transcript in transcript_list])
+                        fetched_transcript = None  # Initialize for this video
 
-                        f.write(f"Video URL: {video_url}\n")
-                        f.write(transcript + '\n\n')
+                        ytt_api = YouTubeTranscriptApi()
+
+                        # 1. Get the list of all available transcripts
+                        transcript_list_obj = ytt_api.list(video_id)
+
+                        # 2. Try to find and fetch English first
+                        try:
+                            transcript_object = transcript_list_obj.find_transcript(['en'])
+                            self.status_update.emit(f"Found English transcript for video {index}/{total_videos}. Fetching...")
+                            fetched_transcript = transcript_object.fetch()
+                        
+                        # 3. If English is not found, fallback to the first available transcript
+                        except NoTranscriptFound:
+                            self.status_update.emit(f"English not found for video {index}/{total_videos}. Trying fallback...")
+                            # Get the first transcript object from the list
+                            first_transcript_object = next(iter(transcript_list_obj))
+                            self.status_update.emit(f"Found fallback: '{first_transcript_object.language}'. Fetching...")
+                            fetched_transcript = first_transcript_object.fetch()
+                        
+                        # 4. If we successfully got a transcript, process and write it
+                        if fetched_transcript:
+                            
+                            transcript = ' '.join([segment.text for segment in fetched_transcript])
+                            
+                            f.write(f"Video URL: {video_url}\n")
+                            f.write(transcript + '\n\n')
+                            self.status_update.emit(f"Extracted transcript for video {index}/{total_videos}")
+                        else:
+                            
+                            self.status_update.emit(f"Could not find any usable transcript for video {index}/{total_videos} ({video_url})")
 
                         progress_percent = int((index / total_videos) * 100)
                         self.progress_update.emit(progress_percent)
-                        self.status_update.emit(f"Extracted transcript for video {index}/{total_videos}")
+
+                    # 5. This 'except' catches if a video has NO transcripts at all
+                    except NoTranscriptFound:
+                        self.status_update.emit(f"Error: No transcripts found for video {index}/{total_videos} ({video_url})")
                     except Exception as video_error:
                         self.status_update.emit(f"Error processing {video_url}: {str(video_error)}")
 
@@ -725,8 +763,8 @@ class GeminiProcessingThread(QThread):
         self.output_file = output_file
         self.api_key = api_key
         self.chunk_size = chunk_size
-        self.selected_model_name = selected_model_name # Store selected model name
-        self.output_language = output_language # Store output language
+        self.selected_model_name = selected_model_name 
+        self.output_language = output_language 
         self.prompt = prompt
         self._is_running = True
         logging.basicConfig(filename='gemini_processing.log', level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -735,16 +773,24 @@ class GeminiProcessingThread(QThread):
     def run(self):
         try:
             genai.configure(api_key=self.api_key)
-            video_chunks = self.split_videos(self.input_file) # input_file is transcript file path
+            video_chunks = self.split_videos(self.input_file)
             final_output_path = self.output_file
             response_file_path = self.output_file.replace(".txt", "_temp_response.txt")
-            total_videos = len(video_chunks) -1 if len(video_chunks) > 1 else 0 # Calculate total videos for progress
+            total_videos = len(video_chunks) -1 if len(video_chunks) > 1 else 0
 
             with open(response_file_path, "w", encoding="utf-8") as response_file:
                 response_file.write("")
+            
+            # Define safety settings to be less restrictive
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
 
-            for video_index, video_chunk in enumerate(video_chunks[1:]): # Start from 1 to skip empty chunk
-                if not self._is_running: # Check for stop signal
+            for video_index, video_chunk in enumerate(video_chunks[1:]):
+                if not self._is_running:
                     return
                 self.status_update.emit(f"\nProcessing Video {video_index + 1}/{total_videos}: Preview: {video_chunk[:50]}...")
                 word_count = len(video_chunk.split())
@@ -755,7 +801,7 @@ class GeminiProcessingThread(QThread):
                 video_transcript_chunks = self.split_text_into_chunks(video_chunk, self.chunk_size)
                 previous_response = ""
                 for chunk_index, chunk in enumerate(video_transcript_chunks):
-                    if not self._is_running: # Check for stop signal inside inner loop
+                    if not self._is_running:
                         return
                     if previous_response:
                         context_prompt = (
@@ -764,19 +810,37 @@ class GeminiProcessingThread(QThread):
                         )
                     else:
                         context_prompt = ""
-
-                    # Replace [Language] with user specified language
+                        
                     formatted_prompt = self.prompt.replace("[Language]", self.output_language)
                     full_prompt = f"{context_prompt}{formatted_prompt}\n\n{chunk}"
 
-                    model = genai.GenerativeModel(self.selected_model_name) # Use selected model
+                    model = genai.GenerativeModel(self.selected_model_name)
 
                     self.status_update.emit(f"Generating Gemini response for Video {video_index + 1}/{total_videos}, Chunk {chunk_index + 1}/{len(video_transcript_chunks)}, please wait...")
-                    response = model.generate_content(full_prompt)
+                    
+                    try:
+                        # Pass the safety settings with the request
+                        response = model.generate_content(
+                            full_prompt,
+                            safety_settings=safety_settings
+                        )
+
+                        # The response text is now accessed via response.text
+                        response_text = response.text
+
+                    except ValueError:
+                        # This error is raised if the prompt is blocked despite the settings
+                        self.status_update.emit(f"<font color='red'>Warning: Prompt for Video {video_index + 1}, Chunk {chunk_index + 1} was blocked by the API. Skipping this chunk.</font>")
+                        # Skip this chunk and continue with the next one
+                        continue 
+                    except Exception as e:
+                        # Handle other potential API errors
+                        self.error_occurred.emit(f"An API error occurred: {str(e)}")
+                        return # Stop processing on other errors
 
                     with open(response_file_path, "a", encoding="utf-8") as response_file:
-                        response_file.write(response.text + "\n\n")
-                    previous_response = response.text
+                        response_file.write(response_text + "\n\n")
+                    previous_response = response_text
                     self.status_update.emit(f"Chunk {chunk_index + 1}/{len(video_transcript_chunks)} processed and saved to temp file.")
 
                 self.status_update.emit(f"All Gemini responses for video {video_index + 1} have been saved to temp file.")
@@ -785,19 +849,19 @@ class GeminiProcessingThread(QThread):
                     video_response_content = response_file.read()
 
                 with open(final_output_path, "a", encoding="utf-8") as final_output_file:
-                    final_output_file.write(f"Video URL: {video_chunks[video_index+1].splitlines()[0].replace('Video URL: ', '')}\n") # Add Video URL as heading
+                    final_output_file.write(f"Video URL: {video_chunks[video_index+1].splitlines()[0].replace('Video URL: ', '')}\n")
                     final_output_file.write(video_response_content + "\n\n")
 
                 with open(response_file_path, "w", encoding="utf-8") as response_file:
-                    response_file.write("") # Clear temp file
+                    response_file.write("")
 
-                progress_percent = int(((video_index + 1) / total_videos) * 100) if total_videos > 0 else 100 # Calculate Gemini progress
-                self.progress_update.emit(progress_percent) # Emit Gemini progress
+                progress_percent = int(((video_index + 1) / total_videos) * 100) if total_videos > 0 else 100
+                self.progress_update.emit(progress_percent)
                 self.status_update.emit(f"Final Gemini output for video {video_index + 1} appended to {final_output_path}")
 
             self.status_update.emit(f"All Gemini responses for all videos have been saved to {final_output_path}.")
             self.processing_complete.emit(final_output_path)
-            self.progress_update.emit(100) # Ensure progress bar reaches 100% at the end
+            self.progress_update.emit(100)
         except Exception as e:
             error_message = f"Gemini error: {str(e)}"
             self.error_occurred.emit(error_message)
@@ -815,7 +879,7 @@ class GeminiProcessingThread(QThread):
     def split_videos(self, file_path):
         with open(file_path, "r", encoding="utf-8") as file:
             content = file.read()
-        video_chunks = re.split(r'(?=Video URL:)', content) # Split by Video URL: from transcript file
+        video_chunks = re.split(r'(?=Video URL:)', content)
         video_chunks = [chunk.strip() for chunk in video_chunks if chunk.strip()]
         return video_chunks
 
